@@ -26,9 +26,6 @@ pub struct FramedWrite<T, B> {
     final_flush_done: bool,
 
     encoder: Encoder<B>,
-
-    /// Control frames waiting behind an unfinished DATA frame or header block.
-    control: Cursor<BytesMut>,
 }
 
 #[derive(Debug)]
@@ -61,7 +58,8 @@ struct Encoder<B> {
 enum Next<B> {
     Data(frame::Data<B>),
     DataWithControl(frame::Data<B>),
-    Continuation(frame::Continuation, FrameSize),
+    Continuation(frame::Continuation),
+    ContinuationWithControl(frame::Continuation, FrameSize),
     // Prevent ordinary frames from overtaking the separate control queue.
     Control,
 }
@@ -108,7 +106,6 @@ where
                 chain_threshold,
                 min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
             },
-            control: Cursor::new(BytesMut::new()),
         }
     }
 
@@ -152,7 +149,12 @@ where
             return Poll::Ready(Ok(()));
         }
 
-        if control_frame_capacity(item) > MAX_CONTROL_BUFFER_SIZE - self.control.remaining() {
+        let queued = if self.encoder.has_control() {
+            self.encoder.hpack.scratch_mut().len()
+        } else {
+            0
+        };
+        if control_frame_capacity(item) > MAX_CONTROL_BUFFER_SIZE - queued {
             return Poll::Pending;
         }
 
@@ -165,28 +167,29 @@ where
             return self.encoder.buffer(item);
         }
 
-        // Keep controls behind the unfinished frame so reads can continue while
-        // writes are blocked. A full queue retains the usual write backpressure.
-        assert!(
-            control_frame_capacity(&item) <= MAX_CONTROL_BUFFER_SIZE - self.control.remaining()
-        );
-        let sent = self.control.position() as usize;
-        self.control.get_mut().advance(sent);
-        self.control.set_position(0);
-
+        // No new header block can be encoded until `next` is cleared. Reuse
+        // HPACK's idle scratch buffer for controls during that interval.
+        if !self.encoder.has_control() {
+            self.encoder.hpack.scratch_mut().clear();
+            self.encoder.next = match self.encoder.next.take() {
+                Some(Next::Data(frame)) => Some(Next::DataWithControl(frame)),
+                Some(Next::Continuation(frame)) => Some(Next::ContinuationWithControl(
+                    frame,
+                    self.encoder.max_frame_size,
+                )),
+                None => Some(Next::Control),
+                _ => unreachable!("already deferred"),
+            };
+        }
+        let control = self.encoder.hpack.scratch_mut();
+        assert!(control_frame_capacity(&item) <= MAX_CONTROL_BUFFER_SIZE - control.len());
         match item {
-            Frame::Ping(frame) => frame.encode(self.control.get_mut()),
-            Frame::Settings(frame) => frame.encode(self.control.get_mut()),
-            Frame::Reset(frame) => frame.encode(self.control.get_mut()),
-            Frame::GoAway(frame) => frame.encode(self.control.get_mut()),
+            Frame::Ping(frame) => frame.encode(control),
+            Frame::Settings(frame) => frame.encode(control),
+            Frame::Reset(frame) => frame.encode(control),
+            Frame::GoAway(frame) => frame.encode(control),
             _ => unreachable!("expected control frame"),
         }
-
-        self.encoder.next = match self.encoder.next.take() {
-            Some(Next::Data(frame)) => Some(Next::DataWithControl(frame)),
-            None => Some(Next::Control),
-            next => next,
-        };
 
         Ok(())
     }
@@ -221,25 +224,21 @@ where
                 }
             }
 
-            match self.encoder.unset_frame(&self.control) {
+            match self.encoder.unset_frame() {
                 ControlFlow::Continue => (),
                 ControlFlow::Break => break,
             }
         }
 
         if matches!(self.encoder.next, Some(Next::Control)) {
-            while self.control.has_remaining() {
-                let n = ready!(poll_write_buf(
-                    Pin::new(&mut self.inner),
-                    cx,
-                    &mut self.control
-                ))?;
+            let control = self.encoder.hpack.scratch_mut();
+            while control.has_remaining() {
+                let n = ready!(poll_write_buf(Pin::new(&mut self.inner), cx, control))?;
                 if n == 0 {
                     return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
                 }
             }
-            self.control.set_position(0);
-            self.control.get_mut().clear();
+            control.clear();
             self.encoder.next = None;
         }
 
@@ -282,7 +281,7 @@ where
     B: Buf,
 {
     #[inline(always)]
-    fn unset_frame(&mut self, control: &Cursor<BytesMut>) -> ControlFlow {
+    fn unset_frame(&mut self) -> ControlFlow {
         // Clear internal buffer
         self.buf.set_position(0);
         self.buf.get_mut().clear();
@@ -300,18 +299,24 @@ where
                 debug_assert!(self.is_empty());
                 ControlFlow::Break
             }
-            Some(Next::Continuation(frame, max_frame_size)) => {
-                // Buffer the continuation frame, then try to write again
-                // with the settings in effect when the header block began.
+            Some(Next::Continuation(frame)) => {
+                let mut buf = limited_write_buf!(self);
+                if let Some(continuation) = frame.encode(&mut buf) {
+                    self.next = Some(Next::Continuation(continuation));
+                }
+                ControlFlow::Continue
+            }
+            Some(Next::ContinuationWithControl(frame, max_frame_size)) => {
+                // The SETTINGS ACK follows the complete header block, so its
+                // new frame limit must not affect this block's remaining frames.
                 let limit = max_frame_size as usize + frame::HEADER_LEN;
                 let mut buf = self.buf.get_mut().limit(limit);
-                if let Some(continuation) = frame.encode(&mut buf) {
-                    self.next = Some(Next::Continuation(continuation, max_frame_size));
-                } else if control.has_remaining() {
-                    // Keep later frames behind the controls even if writing the
-                    // final CONTINUATION returns pending.
-                    self.next = Some(Next::Control);
-                }
+                self.next = Some(match frame.encode(&mut buf) {
+                    Some(continuation) => {
+                        Next::ContinuationWithControl(continuation, max_frame_size)
+                    }
+                    None => Next::Control,
+                });
                 ControlFlow::Continue
             }
             Some(Next::Control) => {
@@ -366,13 +371,13 @@ where
             Frame::Headers(v) => {
                 let mut buf = limited_write_buf!(self);
                 if let Some(continuation) = v.encode(&mut self.hpack, &mut buf) {
-                    self.next = Some(Next::Continuation(continuation, self.max_frame_size));
+                    self.next = Some(Next::Continuation(continuation));
                 }
             }
             Frame::PushPromise(v) => {
                 let mut buf = limited_write_buf!(self);
                 if let Some(continuation) = v.encode(&mut self.hpack, &mut buf) {
-                    self.next = Some(Next::Continuation(continuation, self.max_frame_size));
+                    self.next = Some(Next::Continuation(continuation));
                 }
             }
             Frame::Settings(v) => {
@@ -425,6 +430,15 @@ where
 }
 
 impl<B> Encoder<B> {
+    fn has_control(&self) -> bool {
+        matches!(
+            self.next,
+            Some(Next::DataWithControl(_))
+                | Some(Next::ContinuationWithControl(..))
+                | Some(Next::Control)
+        )
+    }
+
     fn max_frame_size(&self) -> usize {
         self.max_frame_size as usize
     }
@@ -722,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_continuations_keep_original_frame_size() {
+    fn deferred_continuations_keep_original_frame_size() {
         let waker = Waker::from(Arc::new(NoopWake));
         let mut cx = Context::from_waker(&waker);
         let mut writer = writer(false);
@@ -779,18 +793,18 @@ mod tests {
                 .unwrap();
         }
         let pending = Frame::from(frame::Ping::pong([5; 8]));
-        let queued = writer.control.get_ref().clone();
+        let queued = writer.encoder.hpack.scratch_mut().clone();
         for _ in 0..2 {
             assert!(writer.poll_ready_control(&mut cx, &pending).is_pending());
-            assert_eq!(writer.control.get_ref(), &queued);
+            assert_eq!(writer.encoder.hpack.scratch_mut(), &queued);
         }
         let goaway = Frame::from(frame::GoAway::new(
             frame::StreamId::zero(),
             frame::Reason::NO_ERROR,
         ));
         assert!(writer.poll_ready_control(&mut cx, &goaway).is_pending());
-        assert_eq!(writer.control.get_ref(), &queued);
-        assert!(writer.control.remaining() <= MAX_CONTROL_BUFFER_SIZE);
+        assert_eq!(writer.encoder.hpack.scratch_mut(), &queued);
+        assert!(writer.encoder.hpack.scratch_mut().remaining() <= MAX_CONTROL_BUFFER_SIZE);
 
         writer.get_mut().allowance = usize::MAX;
         assert!(matches!(
@@ -816,13 +830,186 @@ mod tests {
         writer
             .send_control(&mut cx, frame::Ping::pong([6; 8]).into())
             .unwrap();
-        assert_eq!(writer.control.get_ref().capacity(), 0);
+        assert!(!writer.encoder.has_control());
         writer.get_mut().allowance = usize::MAX;
         assert!(matches!(writer.flush(&mut cx), Poll::Ready(Ok(()))));
         assert_eq!(
             wire_frames(&writer.inner.written),
             vec![(6, 1, &[6; 8][..])]
         );
+    }
+
+    #[test]
+    fn deferred_controls_can_reuse_header_scratch() {
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut cx = Context::from_waker(&waker);
+        let mut writer = writer(false);
+        let mut fields = http::HeaderMap::new();
+        fields.insert("example", http::HeaderValue::from_static("value"));
+        writer.get_mut().allowance = usize::MAX;
+        writer
+            .buffer(frame::Headers::new(1.into(), frame::Pseudo::default(), fields.clone()).into())
+            .unwrap();
+        assert!(matches!(writer.flush(&mut cx), Poll::Ready(Ok(()))));
+        assert!(!writer.encoder.hpack.scratch_mut().is_empty());
+
+        writer.get_mut().allowance = 0;
+        writer
+            .buffer(frame::Data::new(1.into(), Bytes::from(vec![42; 4096])).into())
+            .unwrap();
+        writer
+            .send_control(&mut cx, frame::Ping::pong([9; 8]).into())
+            .unwrap();
+        writer.get_mut().allowance = usize::MAX;
+        assert!(matches!(writer.flush(&mut cx), Poll::Ready(Ok(()))));
+        writer
+            .buffer(frame::Headers::new(3.into(), frame::Pseudo::default(), fields).into())
+            .unwrap();
+        assert!(matches!(writer.flush(&mut cx), Poll::Ready(Ok(()))));
+
+        let frames = wire_frames(&writer.inner.written);
+        assert_eq!(frames.len(), 4);
+        assert_eq!(frames[0].0, 1);
+        assert_eq!(frames[1], (0, 0, &vec![42; 4096][..]));
+        assert_eq!(frames[2], (6, 1, &[9; 8][..]));
+        assert_eq!(frames[3].0, 1);
+    }
+
+    #[test]
+    fn borrowed_data_preserves_drop_checking() {
+        let mut writer = FramedWrite::new(TestIo {
+            written: Vec::new(),
+            allowance: 0,
+            vectored: false,
+        });
+        // Declaring the payload after the writer was already accepted before
+        // deferred controls were supported, even though it is dropped first.
+        let payload = vec![42; 4096];
+        writer
+            .buffer(frame::Data::new(1.into(), payload.as_slice()).into())
+            .unwrap();
+    }
+    #[test]
+    fn ordinary_continuations_use_updated_frame_size() {
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut cx = Context::from_waker(&waker);
+        for (old_max, new_max) in [(16_384, 65_536), (65_536, 16_384)] {
+            let mut writer = writer(false);
+            writer.set_max_frame_size(old_max);
+            let mut fields = http::HeaderMap::new();
+            fields.insert(
+                "large",
+                http::HeaderValue::from_bytes(&vec![b'x'; 128 * 1024]).unwrap(),
+            );
+            writer
+                .buffer(frame::Headers::new(1.into(), frame::Pseudo::default(), fields).into())
+                .unwrap();
+            writer.get_mut().allowance = 5;
+            assert!(writer.flush(&mut cx).is_pending());
+            writer.set_max_frame_size(new_max);
+            writer.get_mut().allowance = usize::MAX;
+            assert!(matches!(writer.flush(&mut cx), Poll::Ready(Ok(()))));
+
+            let frames = wire_frames(&writer.inner.written);
+            assert!(frames.len() >= 3);
+            assert_eq!(frames[0].0, 1);
+            assert!(frames[0].2.len() <= old_max);
+            assert!(frames[1..]
+                .iter()
+                .all(|frame| frame.0 == 9 && frame.2.len() <= new_max));
+            assert!(frames[1..].iter().any(|frame| frame.2.len() == new_max));
+            assert_eq!(frames.last().unwrap().1 & 4, 4);
+        }
+    }
+
+    #[test]
+    fn deferred_controls_drain_between_episodes() {
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut cx = Context::from_waker(&waker);
+        let mut writer = writer(false);
+        for byte in 0..3 {
+            writer.get_mut().allowance = 0;
+            writer
+                .buffer(frame::Data::new(1.into(), Bytes::from(vec![byte; 4096])).into())
+                .unwrap();
+            writer
+                .send_control(&mut cx, frame::Ping::pong([byte; 8]).into())
+                .unwrap();
+            writer.get_mut().allowance = usize::MAX;
+            assert!(matches!(writer.flush(&mut cx), Poll::Ready(Ok(()))));
+            assert!(writer.has_capacity());
+            assert_eq!(writer.take_last_data_frame().unwrap().payload().len(), 0);
+        }
+        let frames = wire_frames(&writer.inner.written);
+        assert_eq!(frames.len(), 6);
+        for (byte, pair) in frames.chunks_exact(2).enumerate() {
+            assert_eq!(pair[0], (0, 0, &vec![byte as u8; 4096][..]));
+            assert_eq!(pair[1], (6, 1, &[byte as u8; 8][..]));
+        }
+    }
+
+    #[test]
+    fn dropping_pending_writer_releases_data_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct Tracked {
+            data: Bytes,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Buf for Tracked {
+            fn remaining(&self) -> usize {
+                self.data.remaining()
+            }
+            fn chunk(&self) -> &[u8] {
+                self.data.chunk()
+            }
+            fn advance(&mut self, cnt: usize) {
+                self.data.advance(cnt);
+            }
+        }
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut cx = Context::from_waker(&waker);
+        // Drop ordinary DATA, deferred DATA, and a control-only remainder.
+        for (defer, allowance) in [(false, 0), (true, 0), (true, 4105)] {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut writer = FramedWrite::new(TestIo {
+                written: Vec::new(),
+                allowance: 0,
+                vectored: false,
+            });
+            writer
+                .buffer(
+                    frame::Data::new(
+                        1.into(),
+                        Tracked {
+                            data: Bytes::from(vec![42; 4096]),
+                            drops: drops.clone(),
+                        },
+                    )
+                    .into(),
+                )
+                .unwrap();
+            if defer {
+                let frame = frame::Ping::pong([1; 8]).into();
+                assert!(matches!(
+                    writer.poll_ready_control(&mut cx, &frame),
+                    Poll::Ready(Ok(()))
+                ));
+                writer.buffer_control(frame).unwrap();
+            }
+            writer.get_mut().allowance = allowance;
+            assert!(writer.flush(&mut cx).is_pending());
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+            drop(writer);
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+        }
     }
 }
 

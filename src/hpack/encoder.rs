@@ -62,6 +62,12 @@ impl Encoder {
         self.scratch = scratch;
     }
 
+    /// The frame writer can reuse this buffer while further header encoding is
+    /// blocked. It must drain those bytes before encoding another header block.
+    pub(crate) fn scratch_mut(&mut self) -> &mut BytesMut {
+        &mut self.scratch
+    }
+
     /// Queues a max size update.
     ///
     /// The next call to `encode` will include a dynamic size update frame.
